@@ -1,0 +1,36 @@
+# WorkTide golangci-lint 配置
+# 启用一组主流、稳定的检查器。可按需增删。
+
+run:
+  timeout: 5m
+  go: "1.22"
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck        # 检查未处理的错误
+    - govet           # go vet
+    - ineffassign     # 无效赋值
+    - staticcheck     # 综合静态检查
+    - unused          # 未使用代码
+    - gofmt           # 格式化
+    - revive          # 代码风格
+    - gocritic        # 常见坑与改进
+    - misspell        # 拼写
+
+linters-settings:
+  govet:
+    enable-all: false
+  revive:
+    severity: warning
+
+issues:
+  exclude-rules:
+    # 测试代码允许使用 panic 与未处理错误。
+    - path: _test\.go
+      linters: [errcheck, gosec]
+    # main 包允许非必要错误处理简化。
+    - path: cmd/
+      linters: [errcheck]
+  max-issues-per-linter: 0
+  max-same-issues: 0

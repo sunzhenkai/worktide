@@ -1,0 +1,27 @@
+# WorkTide 示例配置
+# 将此文件复制到配置目录（macOS: ~/Library/Application Support/worktide/）
+# 并按需修改。未列出的字段将使用内置默认值。
+
+# 主题：default | dark
+theme:
+  name: default
+
+# 全局快捷键绑定（覆盖默认值）
+keymap:
+  quit: "q"          # 退出应用
+  focus_nav: "tab"   # 在侧边导航与主内容区之间切换焦点
+  help: "?"          # 打开帮助面板
+  settings: "s"      # 打开设置
+
+# 工具启用列表：仅加载此处列出的工具。
+# 为空时启用默认示例工具（welcome、sysinfo）。
+# 引用未注册的工具 ID 会被忽略并记录警告。
+tools:
+  enabled:
+    - welcome
+    - sysinfo
+
+# 本地后端：负责异步任务、缓存与持久化。
+# 关闭后应用以「无后端」模式降级运行。
+backend:
+  enabled: true

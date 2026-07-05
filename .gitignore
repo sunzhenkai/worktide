@@ -1,0 +1,59 @@
+# 构建产物
+/bin/
+/dist/
+/worktide
+/worktide.exe
+*.exe
+*.test
+*.out
+*.dll
+*.so
+*.dylib
+
+# 测试覆盖率 / 性能分析
+*.cover
+coverage.out
+coverage.txt
+coverage.html
+*.prof
+*.pprof
+
+# 本地数据与缓存（运行时生成）
+/data/
+/cache/
+/tmp/
+*.db
+*.db.lock
+*.sqlite
+*.sqlite3
+
+# 日志
+*.log
+/logs/
+
+# 环境变量 / 密钥（避免泄露）
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+.fleet/
+*.swp
+*.swo
+*~
+
+# Go 工作区 / 依赖
+/vendor/
+go.work
+go.work.sum
+
+# 其他工具
+.air.toml
+.air.conf
