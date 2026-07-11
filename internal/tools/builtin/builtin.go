@@ -7,19 +7,30 @@
 package builtin
 
 import (
+	"github.com/sunzhenkai/worktide/internal/config"
+	"github.com/sunzhenkai/worktide/internal/service"
 	"github.com/sunzhenkai/worktide/internal/tools"
 )
 
 // RegisterAll 将所有内置工具登记到给定注册中心。
 // 重复 ID 会返回错误，调用方可据此决定是否致命。
-func RegisterAll(registry *tools.Registry) error {
+func RegisterAll(registry *tools.Registry, opts RegisterOptions) error {
 	for _, t := range []tools.Tool{
 		NewWelcome(),
 		NewSysInfo(),
+		NewServices(opts.Manager, opts.Paths),
 	} {
 		if err := registry.Register(t); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// RegisterOptions 携带 RegisterAll 需要的外部依赖。
+type RegisterOptions struct {
+	// Manager 是服务管理器；nil 时 services 工具降级为「无 manager」提示。
+	Manager *service.Manager
+	// Paths 是工作目录解析结果。
+	Paths config.Paths
 }

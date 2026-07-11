@@ -24,9 +24,26 @@ type Paths struct {
 // ConfigFileName 是默认配置文件名。
 const ConfigFileName = "config.yaml"
 
+// ServicesFileName 是 services.yaml 文件名（CLI 写入的运行时服务声明）。
+const ServicesFileName = "services.yaml"
+
+// DBFileName 是 bbolt 数据库文件名。
+const DBFileName = "worktide.db"
+
 // ConfigFilePath 返回默认配置文件的完整路径。
 func (p Paths) ConfigFilePath() string {
 	return filepath.Join(p.ConfigDir, ConfigFileName)
+}
+
+// ServicesFile 返回 services.yaml 的完整路径。
+// 用于 CLI 写入运行时服务声明，路径位于 ConfigDir 下。
+func (p Paths) ServicesFile() string {
+	return filepath.Join(p.ConfigDir, ServicesFileName)
+}
+
+// DataFile 返回 bbolt 数据库文件的完整路径，位于 DataDir 下。
+func (p Paths) DataFile() string {
+	return filepath.Join(p.DataDir, DBFileName)
 }
 
 // ResolvePaths 根据当前操作系统解析 WorkTide 的关键目录。

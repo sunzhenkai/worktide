@@ -31,7 +31,7 @@ func TestLoadFullFallbackOnMissingFile(t *testing.T) {
 		CacheDir:  filepath.Join(base, "cache"),
 		LogDir:    filepath.Join(base, "logs"),
 	}
-	cfg, err := loadConfig(paths)
+	cfg, _, err := loadConfig(paths)
 	if err != nil {
 		t.Fatalf("配置缺失时应使用默认值而非报错，实际: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestLoadFullReadsFile(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFilePath(), content, 0o600); err != nil {
 		t.Fatalf("写入测试配置失败: %v", err)
 	}
-	cfg, err := loadConfig(paths)
+	cfg, _, err := loadConfig(paths)
 	if err != nil {
 		t.Fatalf("loadConfig 失败: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestEnvOverrideFile(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFilePath(), content, 0o600); err != nil {
 		t.Fatalf("写入测试配置失败: %v", err)
 	}
-	cfg, err := loadConfig(paths)
+	cfg, _, err := loadConfig(paths)
 	if err != nil {
 		t.Fatalf("loadConfig 失败: %v", err)
 	}

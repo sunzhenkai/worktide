@@ -1,15 +1,22 @@
 // Package config 负责 WorkTide 的跨平台目录解析、配置加载与默认值管理。
-//
-// 阶段 1 仅提供最小骨架（Config 结构 + 返回默认值的 Load），保证应用可构建。
-// 完整的目录解析、Viper 合并加载与热加载将在阶段 2 实现。
 package config
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"go.yaml.in/yaml/v3"
+)
 
 // Config 是 WorkTide 的运行时配置根结构。
 type Config struct {
-	Theme   ThemeConfig   `mapstructure:"theme"`
-	Keymap  KeymapConfig  `mapstructure:"keymap"`
-	Tools   ToolsConfig   `mapstructure:"tools"`
-	Backend BackendConfig `mapstructure:"backend"`
+	Theme    ThemeConfig             `mapstructure:"theme"`
+	Keymap   KeymapConfig            `mapstructure:"keymap"`
+	Tools    ToolsConfig             `mapstructure:"tools"`
+	Backend  BackendConfig           `mapstructure:"backend"`
+	Include  []string                `mapstructure:"include"`
+	Services map[string]ServiceDef   `mapstructure:"services"`
 }
 
 // ThemeConfig 定义主题相关配置。
@@ -38,6 +45,80 @@ type BackendConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 }
 
+// ServiceDef 描述一个服务的声明信息（来自 config.yaml / include / services.yaml）。
+// 声明仅包含「如何启动」，运行态（PID / PGID / LogPath）由 bbolt 维护。
+type ServiceDef struct {
+	// Cwd 是服务工作目录。
+	Cwd string `yaml:"cwd" mapstructure:"cwd"`
+	// Command 是启动命令（shell 字符串或 argv 数组）。
+	Command ServiceCommand `yaml:"command" mapstructure:"command"`
+	// Description 可选的描述信息。
+	Description string `yaml:"description,omitempty" mapstructure:"description,omitempty"`
+	// Env 是附加到子进程的环境变量。
+	Env map[string]string `yaml:"env,omitempty" mapstructure:"env,omitempty"`
+	// ForceRestart 在热加载时若为 true 则提示需要重启。
+	ForceRestart bool `yaml:"force_restart,omitempty" mapstructure:"force_restart,omitempty"`
+}
+
+// ServiceCommand 支持两种形态：shell 字符串或 argv 数组。
+// 通过 UnmarshalYAML 区分。
+type ServiceCommand struct {
+	// Shell 为 true 时表示按 shell 命令解析（Cmd 中是单一字符串）。
+	Shell bool
+	// Cmd 包含解释后的命令：
+	//   - Shell=true：Cmd[0] 是完整命令字符串
+	//   - Shell=false：Cmd 是 argv 数组
+	Cmd []string
+}
+
+// UnmarshalYAML 实现 shell / argv 双形态解码。
+func (s *ServiceCommand) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		s.Shell = true
+		s.Cmd = []string{node.Value}
+		return nil
+	case yaml.SequenceNode:
+		if len(node.Content) == 0 {
+			return errors.New("command 数组不能为空")
+		}
+		parts := make([]string, 0, len(node.Content))
+		for i, n := range node.Content {
+			if n.Kind != yaml.ScalarNode {
+				return fmt.Errorf("command 数组第 %d 项必须是字符串", i)
+			}
+			parts = append(parts, n.Value)
+		}
+		s.Shell = false
+		s.Cmd = parts
+		return nil
+	default:
+		return fmt.Errorf("command 必须是字符串或字符串数组，实际类型: %v", node.Kind)
+	}
+}
+
+// MarshalYAML 把 ServiceCommand 序列化为字符串或数组。
+func (s ServiceCommand) MarshalYAML() (any, error) {
+	if s.Shell {
+		if len(s.Cmd) == 0 {
+			return "", nil
+		}
+		return s.Cmd[0], nil
+	}
+	return s.Cmd, nil
+}
+
+// String 把命令格式化为可读字符串。
+func (s ServiceCommand) String() string {
+	if len(s.Cmd) == 0 {
+		return ""
+	}
+	if s.Shell {
+		return s.Cmd[0]
+	}
+	return strings.Join(s.Cmd, " ")
+}
+
 // Default 返回内置默认配置。当配置文件缺失或字段未设置时使用。
 func Default() *Config {
 	return &Config{
@@ -56,7 +137,6 @@ func Default() *Config {
 		Backend: BackendConfig{
 			Enabled: true,
 		},
+		Services: map[string]ServiceDef{},
 	}
 }
-
-// 注意：完整的 Load / LoadFull 实现见 loader.go。

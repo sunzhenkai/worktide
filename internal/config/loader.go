@@ -1,15 +1,15 @@
 package config
 
 import (
-	"errors"
+	"bytes"
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
+	"path/filepath"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/spf13/viper"
+	"go.yaml.in/yaml/v3"
 )
 
 // EnvPrefix 是环境变量的统一前缀。
@@ -17,8 +17,9 @@ const EnvPrefix = "WORKTIDE"
 
 // LoadResult 是配置加载的结果，包含最终配置与解析出的路径。
 type LoadResult struct {
-	Config *Config
-	Paths  Paths
+	Config     *Config
+	Paths      Paths
+	WatchFiles []string
 }
 
 // LoadFull 执行完整的配置加载流程：解析目录 -> 合并默认值/文件/环境变量/命令行 -> 校验。
@@ -28,85 +29,222 @@ func LoadFull() (*LoadResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := loadConfig(paths)
+	cfg, watch, err := loadConfig(paths)
 	if err != nil {
 		return nil, err
 	}
-	return &LoadResult{Config: cfg, Paths: paths}, nil
+	return &LoadResult{Config: cfg, Paths: paths, WatchFiles: watch}, nil
 }
 
-// loadConfig 使用 viper 合并多来源配置并解码到 Config。
+// loadConfig 加载并合并多来源配置。
 //
-// 优先级（高 -> 低）：命令行标志 > 环境变量 > 配置文件 > 内置默认值。
-// 注意：阶段 1 的 Load() 仅返回默认值；本函数提供完整实现。
-func loadConfig(paths Paths) (*Config, error) {
-	v := viper.New()
-
+// 合并顺序（高 -> 低）：
+//   命令行标志 > 环境变量 > services.yaml > include 列表（按顺序） > config.yaml > 内置默认值
+func loadConfig(paths Paths) (*Config, []string, error) {
 	// 1. 内置默认值（最低优先级）。
-	setDefaults(v)
+	cfg := Default()
 
-	// 2. 配置文件（缺失不报错）。
-	v.SetConfigName("config")
-	v.SetConfigType("yaml")
-	v.AddConfigPath(paths.ConfigDir)
-	v.AddConfigPath(".")
-
-	if err := v.ReadInConfig(); err != nil {
-		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
-			// 文件存在但解析失败：记录警告，继续使用默认值。
+	// 2. 读取 config.yaml（如存在）。
+	rootRaw := map[string]any{}
+	if data, err := os.ReadFile(paths.ConfigFilePath()); err == nil {
+		if err := yaml.Unmarshal(data, &rootRaw); err != nil {
 			slog.Warn("配置文件解析失败，使用默认配置", "error", err, "path", paths.ConfigFilePath())
+			rootRaw = map[string]any{}
+		}
+	} else if !os.IsNotExist(err) {
+		slog.Warn("读取配置文件失败", "error", err, "path", paths.ConfigFilePath())
+	}
+
+	// 3. 合并 include 列表（深度合并、循环检测、深度上限）。
+	watch := []string{paths.ConfigFilePath()}
+	if includeRaw, ok := rootRaw["include"].([]any); ok {
+		includePaths := toStringSlice(includeRaw)
+		if len(includePaths) > 0 {
+			visited := map[string]bool{}
+			includeOut, err := mergeIncludes(filepath.Dir(paths.ConfigFilePath()), includePaths, visited, 1)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := deepMerge(rootRaw, includeOut); err != nil {
+				return nil, nil, fmt.Errorf("合并 include 失败: %w", err)
+			}
+			for _, p := range includePaths {
+				expanded, _ := expandPath(p)
+				if expanded == "" {
+					continue
+				}
+				var abs string
+				if filepath.IsAbs(expanded) {
+					abs = expanded
+				} else {
+					abs = filepath.Join(filepath.Dir(paths.ConfigFilePath()), expanded)
+				}
+				if a, err := filepath.Abs(abs); err == nil {
+					watch = append(watch, a)
+				}
+			}
 		}
 	}
+	// 把 include 字段从 rootRaw 移除，避免被反序列化到 Config。
+	delete(rootRaw, "include")
 
-	// 3. 环境变量（自动绑定 WORKTIDE_<KEY>，嵌套用 _ 分隔）。
-	v.SetEnvPrefix(EnvPrefix)
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	v.AutomaticEnv()
-
-	// 4. 命令行标志（最高优先级）。
-	//    阶段 2 暂不接入完整 flag 解析，仅预留 hook。
-	bindFlags(v)
-
-	// 5. 解码到结构体。
-	cfg := Default()
-	if err := v.Unmarshal(cfg); err != nil {
-		return nil, fmt.Errorf("配置解码失败: %w", err)
+	// 4. 把 rootRaw 合并到 cfg。
+	if err := mergeIntoConfig(cfg, rootRaw); err != nil {
+		return nil, nil, err
 	}
 
-	// 6. 后处理：未知工具 ID 告警、空启用列表兜底（兜底由 isKnownTool 配合）。
+	// 5. 读取 services.yaml（如存在），仅覆盖 services 段。
+	if data, err := os.ReadFile(paths.ServicesFile()); err == nil {
+		svcs := map[string]any{}
+		if err := yaml.Unmarshal(data, &svcs); err != nil {
+			slog.Warn("services.yaml 解析失败", "error", err, "path", paths.ServicesFile())
+		} else {
+			if _, hasInclude := svcs["include"]; hasInclude {
+				slog.Warn("services.yaml 含 include 字段，已忽略", "path", paths.ServicesFile())
+				delete(svcs, "include")
+			}
+			if svcMap, ok := svcs["services"].(map[string]any); ok {
+				warnOverride(cfg.Services, svcMap)
+				if err := mergeIntoConfig(cfg, map[string]any{"services": svcMap}); err != nil {
+					return nil, nil, err
+				}
+			}
+		}
+		watch = append(watch, paths.ServicesFile())
+	} else if !os.IsNotExist(err) {
+		slog.Warn("读取 services.yaml 失败", "error", err)
+	}
+
+	// 6. 环境变量覆盖。
+	applyEnvOverrides(cfg)
+
+	// 7. 命令行标志（阶段 2 暂为占位）。
+	bindFlags(cfg)
+
+	// 8. 后处理。
 	cfg = postProcess(cfg)
 
-	return cfg, nil
+	return cfg, watch, nil
 }
 
-// setDefaults 把内置默认值写入 viper。
-func setDefaults(v *viper.Viper) {
-	d := Default()
-	v.SetDefault("theme.name", d.Theme.Name)
-	v.SetDefault("keymap.quit", d.Keymap.Quit)
-	v.SetDefault("keymap.focus_nav", d.Keymap.FocusNav)
-	v.SetDefault("keymap.help", d.Keymap.Help)
-	v.SetDefault("keymap.settings", d.Keymap.Settings)
-	v.SetDefault("tools.enabled", d.Tools.Enabled)
-	v.SetDefault("backend.enabled", d.Backend.Enabled)
+// mergeIntoConfig 把 map[string]any 解码到 cfg。
+// 使用 yaml.Marshal + yaml.Unmarshal 以复用 ServiceCommand.UnmarshalYAML。
+func mergeIntoConfig(cfg *Config, raw map[string]any) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	// 把 map 序列化为 YAML，再 unmarshal 进 cfg。
+	// 这样 ServiceCommand 的 UnmarshalYAML 能正确处理 string/array 双形态。
+	intermediate := struct {
+		*Config
+	}{
+		Config: cfg,
+	}
+	// 先把 raw 合并到 cfg 的零值再统一 unmarshal 更稳。
+	// 但 cfg 已经含默认值，重复 Unmarshal 会覆盖。因此仅把 raw 段 unmarshal 到临时结构。
+	// 简化：把 raw 序列化为 YAML 后 unmarshal 到同类型 Config，然后按 key 合并到 cfg。
+	tmp := Default()
+	if err := decodeYAMLMap(raw, tmp); err != nil {
+		return err
+	}
+	// 合并 tmp 到 cfg。
+	if err := mergeConfigs(cfg, tmp); err != nil {
+		return err
+	}
+	_ = intermediate
+	return nil
 }
 
-// bindFlags 绑定命令行标志到 viper。阶段 2 暂为占位，阶段 3+ 接入完整 flag。
-func bindFlags(_ *viper.Viper) {
+// decodeYAMLMap 把任意 map[string]any 解码到 dst（通过 YAML 序列化中转）。
+func decodeYAMLMap(raw map[string]any, dst *Config) error {
+	data, err := yaml.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("序列化中间配置失败: %w", err)
+	}
+	// 二次解码：把 YAML 解码到 Config，让 ServiceCommand.UnmarshalYAML 生效。
+	return yaml.Unmarshal(data, dst)
+}
+
+// mergeConfigs 把 src 中的非零值合并到 dst（in-place）。
+// 用于 raw map 解码后的 Config 与 Default 合并。
+func mergeConfigs(dst, src *Config) error {
+	if src.Include != nil {
+		dst.Include = append([]string{}, src.Include...)
+	}
+	for k, v := range src.Services {
+		if dst.Services == nil {
+			dst.Services = map[string]ServiceDef{}
+		}
+		dst.Services[k] = v
+	}
+	// 标量/简单字段按非零覆盖。
+	if src.Theme.Name != "" {
+		dst.Theme.Name = src.Theme.Name
+	}
+	if src.Keymap.Quit != "" {
+		dst.Keymap.Quit = src.Keymap.Quit
+	}
+	if src.Keymap.FocusNav != "" {
+		dst.Keymap.FocusNav = src.Keymap.FocusNav
+	}
+	if src.Keymap.Help != "" {
+		dst.Keymap.Help = src.Keymap.Help
+	}
+	if src.Keymap.Settings != "" {
+		dst.Keymap.Settings = src.Keymap.Settings
+	}
+	if src.Tools.Enabled != nil {
+		dst.Tools.Enabled = append([]string{}, src.Tools.Enabled...)
+	}
+	if src.Backend.Enabled {
+		dst.Backend.Enabled = true
+	}
+	_ = bytes.NewBuffer // 防止 unused import 警告
+	return nil
+}
+
+// warnOverride 对比 services 中与 cfg.Services 重名的条目并输出 WARN。
+func warnOverride(existing map[string]ServiceDef, override map[string]any) {
+	for name := range override {
+		if _, ok := existing[name]; ok {
+			slog.Warn("services.yaml 覆盖 config.yaml 中的服务声明", "name", name)
+		}
+	}
+}
+
+// applyEnvOverrides 应用环境变量覆盖（仅支持简单字段）。
+func applyEnvOverrides(cfg *Config) {
+	v := os.Getenv(EnvPrefix + "_THEME_NAME")
+	if v != "" {
+		cfg.Theme.Name = v
+	}
+	if v := os.Getenv(EnvPrefix + "_KEYMAP_QUIT"); v != "" {
+		cfg.Keymap.Quit = v
+	}
+	if v := os.Getenv(EnvPrefix + "_KEYMAP_FOCUS_NAV"); v != "" {
+		cfg.Keymap.FocusNav = v
+	}
+	if v := os.Getenv(EnvPrefix + "_KEYMAP_HELP"); v != "" {
+		cfg.Keymap.Help = v
+	}
+	if v := os.Getenv(EnvPrefix + "_KEYMAP_SETTINGS"); v != "" {
+		cfg.Keymap.Settings = v
+	}
+}
+
+// bindFlags 绑定命令行标志到 cfg。阶段 2 暂为占位，阶段 3+ 接入完整 flag。
+func bindFlags(_ *Config) {
 	// 预留：后续接入 pflag/cobra 时在此绑定。
 }
 
 // knownToolIDs 是当前已注册的工具 ID 集合。
-// 阶段 2 暂用静态集合；阶段 4 将由注册中心动态填充。
 var knownToolIDs = map[string]bool{
-	"welcome": true,
-	"sysinfo": true,
+	"welcome":  true,
+	"sysinfo":  true,
+	"services": true, // 服务管理工具（v1 默认不启用，需显式加入 tools.enabled）
 }
 
 // postProcess 对加载后的配置做校验与兜底：
-//   - 过滤未知工具 ID 并记录警告；
-//   - 启用列表为空时回退到默认示例工具。
 func postProcess(cfg *Config) *Config {
 	valid := make([]string, 0, len(cfg.Tools.Enabled))
 	for _, id := range cfg.Tools.Enabled {
@@ -121,17 +259,18 @@ func postProcess(cfg *Config) *Config {
 		valid = Default().Tools.Enabled
 	}
 	cfg.Tools.Enabled = valid
+	if cfg.Services == nil {
+		cfg.Services = map[string]ServiceDef{}
+	}
 	return cfg
 }
 
-// ---- 向后兼容：阶段 1 的 Load() 保持签名不变 ----
+// ---- 向后兼容 ----
 
-// Load 加载配置并返回。保留阶段 1 的简单签名供 app.Run 使用。
-// 内部委托给 LoadFull，失败时回退到默认值。
+// Load 加载配置并返回。
 func Load() (*Config, error) {
 	res, err := LoadFull()
 	if err != nil {
-		// 加载失败时使用默认值，不向调用方报错（符合 spec：缺失仍能启动）。
 		return Default(), nil
 	}
 	return res.Config, nil
@@ -144,8 +283,8 @@ type ReloadCallback func(*Config)
 
 // Watcher 封装配置文件的变更监听与回调分发。
 type Watcher struct {
-	v       *viper.Viper
 	paths   Paths
+	watch   []string
 	mu      sync.Mutex
 	cbs     []ReloadCallback
 	stopCh  chan struct{}
@@ -153,65 +292,75 @@ type Watcher struct {
 }
 
 // NewWatcher 创建一个基于文件监听的配置热加载器。
-// 创建后调用 Start 开始监听，Stop 结束监听。
 func NewWatcher(paths Paths) (*Watcher, error) {
-	v := viper.New()
-	v.SetConfigName("config")
-	v.SetConfigType("yaml")
-	v.AddConfigPath(paths.ConfigDir)
-	v.AddConfigPath(".")
-	if err := v.ReadInConfig(); err != nil {
-		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
-			return nil, fmt.Errorf("读取配置失败: %w", err)
-		}
-		// 文件不存在：仍创建 watcher，待文件出现后再触发。
+	_, watch, err := loadConfig(paths)
+	if err != nil {
+		watch = []string{paths.ConfigFilePath()}
 	}
 	return &Watcher{
-		v:      v,
 		paths:  paths,
+		watch:  watch,
 		stopCh: make(chan struct{}),
 	}, nil
 }
 
-// OnReload 注册一个热加载回调。回调在每次配置文件变更后收到新快照。
+// OnReload 注册一个热加载回调。
 func (w *Watcher) OnReload(cb ReloadCallback) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.cbs = append(w.cbs, cb)
 }
 
-// Start 开始监听配置文件变更。阻塞调用者应放在 goroutine 中。
-// 仅主题、快捷键等可热加载项会触发回调；后端等需重启的项由调用方自行判断提示。
+// Start 开始监听配置文件变更。
 func (w *Watcher) Start() error {
-	w.v.OnConfigChange(func(_ fsnotify.Event) {
-		cfg := Default()
-		if err := w.v.Unmarshal(cfg); err != nil {
-			slog.Warn("热加载解码失败，忽略本次变更", "error", err)
-			return
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("创建 fsnotify watcher 失败: %w", err)
+	}
+	for _, p := range w.watch {
+		_ = fsw.Add(p)
+	}
+	go func() {
+		defer fsw.Close()
+		for {
+			select {
+			case ev, ok := <-fsw.Events:
+				if !ok {
+					return
+				}
+				slog.Debug("配置文件变更", "event", ev.Op.String(), "file", ev.Name)
+				cfg, _, err := loadConfig(w.paths)
+				if err != nil {
+					slog.Warn("热加载解析失败，忽略本次变更", "error", err)
+					continue
+				}
+				w.mu.Lock()
+				cbs := make([]ReloadCallback, len(w.cbs))
+				copy(cbs, w.cbs)
+				w.mu.Unlock()
+				for _, cb := range cbs {
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								slog.Warn("配置热加载回调 panic", "error", r)
+							}
+						}()
+						cb(cfg)
+					}()
+				}
+			case _, ok := <-fsw.Errors:
+				if !ok {
+					return
+				}
+			case <-w.stopCh:
+				return
+			}
 		}
-		cfg = postProcess(cfg)
-		w.mu.Lock()
-		cbs := make([]ReloadCallback, len(w.cbs))
-		copy(cbs, w.cbs)
-		w.mu.Unlock()
-		for _, cb := range cbs {
-			// 单个回调的 panic 不应影响其他回调。
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						slog.Warn("配置热加载回调 panic", "error", r)
-					}
-				}()
-				cb(cfg)
-			}()
-		}
-	})
-	w.v.WatchConfig()
+	}()
 	return nil
 }
 
-// Stop 停止监听。可多次调用。
+// Stop 停止监听。
 func (w *Watcher) Stop() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -220,10 +369,9 @@ func (w *Watcher) Stop() {
 	}
 	w.stopped = true
 	close(w.stopCh)
-	// viper 内部 watcher 随应用退出自然停止，这里仅标记。
 }
 
-// PathsAccessible 返回配置文件是否存在（用于区分首次启动）。
+// PathsAccessible 返回配置文件是否存在。
 func PathsAccessible(paths Paths) bool {
 	_, err := os.Stat(paths.ConfigFilePath())
 	return err == nil

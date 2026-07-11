@@ -11,7 +11,7 @@ import (
 // TestRegisterAll 校验 RegisterAll 登记了预期工具。
 func TestRegisterAll(t *testing.T) {
 	r := tools.NewRegistry()
-	if err := RegisterAll(r); err != nil {
+	if err := RegisterAll(r, RegisterOptions{}); err != nil {
 		t.Fatalf("RegisterAll 失败: %v", err)
 	}
 	ids := map[string]bool{}
@@ -28,10 +28,10 @@ func TestRegisterAll(t *testing.T) {
 // TestRegisterAllDuplicate 校验重复注册返回错误。
 func TestRegisterAllDuplicate(t *testing.T) {
 	r := tools.NewRegistry()
-	if err := RegisterAll(r); err != nil {
+	if err := RegisterAll(r, RegisterOptions{}); err != nil {
 		t.Fatalf("首次 RegisterAll 失败: %v", err)
 	}
-	if err := RegisterAll(r); err == nil {
+	if err := RegisterAll(r, RegisterOptions{}); err == nil {
 		t.Error("重复注册应返回错误")
 	}
 }
